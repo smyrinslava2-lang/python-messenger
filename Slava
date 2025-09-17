@@ -1,0 +1,448 @@
+import tkinter as tk
+from tkinter import ttk, scrolledtext, messagebox, simpledialog
+import sqlite3
+import hashlib
+import secrets
+import base64
+from datetime import datetime
+from cryptography.fernet import Fernet
+import os
+
+# ==================== КОНФИГУРАЦИЯ ====================
+DB_NAME = "secure_messenger.db"
+
+# ==================== ШИФРОВАНИЕ ====================
+class CryptoManager:
+    def __init__(self):
+        pass
+    
+    def generate_key_from_password(self, password, salt):
+        """Генерация ключа из пароля с использованием salt"""
+        kdf = hashlib.pbkdf2_hmac(
+            'sha256',
+            password.encode(),
+            salt,
+            100000,
+            32
+        )
+        return base64.urlsafe_b64encode(kdf)
+    
+    def encrypt_message(self, message, password, salt):
+        """Шифрование сообщения"""
+        try:
+            key = self.generate_key_from_password(password, salt)
+            fernet = Fernet(key)
+            encrypted_message = fernet.encrypt(message.encode())
+            return base64.urlsafe_b64encode(encrypted_message).decode()
+        except:
+            return message  # Если шифрование не удалось, возвращаем исходный текст
+    
+    def decrypt_message(self, encrypted_message, password, salt):
+        """Дешифрование сообщения"""
+        try:
+            key = self.generate_key_from_password(password, salt)
+            fernet = Fernet(key)
+            decrypted_message = fernet.decrypt(base64.urlsafe_b64decode(encrypted_message))
+            return decrypted_message.decode()
+        except:
+            return encrypted_message  # Если не удалось расшифровать, возвращаем как есть
+
+# ==================== БАЗА ДАННЫХ ====================
+class Database:
+    def __init__(self):
+        self.init_db()
+        self.crypto = CryptoManager()
+        
+    def init_db(self):
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        
+        # Таблица пользователей
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                salt TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Таблица контактов
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS contacts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_username TEXT NOT NULL,
+                contact_username TEXT NOT NULL,
+                added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(owner_username, contact_username)
+            )
+        ''')
+        
+        # Таблица сообщений
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender TEXT NOT NULL,
+                receiver TEXT NOT NULL,
+                message TEXT NOT NULL,
+                encrypted INTEGER DEFAULT 1,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+    
+    def create_user(self, username, password):
+        """Создание нового пользователя"""
+        salt = secrets.token_bytes(16)
+        password_hash = hashlib.pbkdf2_hmac(
+            'sha256', password.encode(), salt, 100000
+        ).hex()
+        
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "INSERT INTO users (username, password_hash, salt) VALUES (?, ?, ?)",
+                (username, password_hash, salt.hex())
+            )
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+        finally:
+            conn.close()
+    
+    def verify_user(self, username, password):
+        """Проверка пользователя"""
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT password_hash, salt FROM users WHERE username = ?", 
+            (username,)
+        )
+        result = cursor.fetchone()
+        conn.close()
+        
+        if not result:
+            return False
+            
+        stored_hash, salt_hex = result
+        salt = bytes.fromhex(salt_hex)
+        input_hash = hashlib.pbkdf2_hmac(
+            'sha256', password.encode(), salt, 100000
+        ).hex()
+        
+        return stored_hash == input_hash
+    
+    def add_contact(self, owner_username, contact_username):
+        """Добавление контакта"""
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "INSERT INTO contacts (owner_username, contact_username) VALUES (?, ?)",
+                (owner_username, contact_username)
+            )
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+        finally:
+            conn.close()
+    
+    def get_contacts(self, username):
+        """Получение списка контактов"""
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT contact_username FROM contacts WHERE owner_username = ? ORDER BY contact_username",
+            (username,)
+        )
+        contacts = [row[0] for row in cursor.fetchall()]
+        conn.close()
+        return contacts
+    
+    def save_message(self, sender, receiver, message, password, salt):
+        """Сохранение сообщения с шифрованием"""
+        encrypted_msg = self.crypto.encrypt_message(message, password, salt)
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO messages (sender, receiver, message, encrypted) VALUES (?, ?, ?, ?)",
+            (sender, receiver, encrypted_msg, 1)
+        )
+        conn.commit()
+        conn.close()
+        return encrypted_msg
+    
+    def get_message_history(self, user1, user2, password, salt):
+        """Получение истории сообщений с дешифровкой"""
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT sender, message, timestamp FROM messages 
+            WHERE (sender = ? AND receiver = ?) OR (sender = ? AND receiver = ?)
+            ORDER BY timestamp ASC
+        ''', (user1, user2, user2, user1))
+        
+        messages = []
+        for sender, message, timestamp in cursor.fetchall():
+            try:
+                # Пытаемся расшифровать сообщение
+                decrypted_msg = self.crypto.decrypt_message(message, password, salt)
+                messages.append((sender, decrypted_msg, timestamp))
+            except:
+                # Если не удалось расшифровать, показываем как есть
+                messages.append((sender, message, timestamp))
+        
+        conn.close()
+        return messages
+
+# ==================== ГРАФИЧЕСКИЙ ИНТЕРФЕЙС ====================
+class MessengerApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Secure Messenger - Локальный мессенджер")
+        self.root.geometry("900x600")
+        self.root.minsize(700, 500)
+        
+        self.db = Database()
+        self.crypto = CryptoManager()
+        
+        self.current_user = None
+        self.current_password = None
+        self.salt = None
+        self.current_contact = None
+        
+        self.setup_gui()
+        self.show_auth_frame()
+    
+    def setup_gui(self):
+        # Стиль
+        style = ttk.Style()
+        style.configure('TFrame', background='#f0f0f0')
+        style.configure('TButton', padding=6)
+        style.configure('TLabel', background='#f0f0f0')
+        
+        # Главный фрейм
+        self.main_frame = ttk.Frame(self.root)
+        self.main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Фрейм аутентификации
+        self.auth_frame = ttk.Frame(self.main_frame)
+        
+        ttk.Label(self.auth_frame, text="🔒 Secure Messenger", 
+                 font=('Arial', 16, 'bold')).pack(pady=20)
+        
+        auth_form = ttk.Frame(self.auth_frame)
+        auth_form.pack(pady=20)
+        
+        ttk.Label(auth_form, text="Логин:", font=('Arial', 10)).grid(row=0, column=0, sticky='e', padx=5, pady=8)
+        self.username_entry = ttk.Entry(auth_form, width=25, font=('Arial', 10))
+        self.username_entry.grid(row=0, column=1, padx=5, pady=8)
+        
+        ttk.Label(auth_form, text="Пароль:", font=('Arial', 10)).grid(row=1, column=0, sticky='e', padx=5, pady=8)
+        self.password_entry = ttk.Entry(auth_form, width=25, show="*", font=('Arial', 10))
+        self.password_entry.grid(row=1, column=1, padx=5, pady=8)
+        
+        btn_frame = ttk.Frame(auth_form)
+        btn_frame.grid(row=2, column=0, columnspan=2, pady=15)
+        
+        ttk.Button(btn_frame, text="Войти", command=self.login, width=12).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Регистрация", command=self.register, width=12).pack(side=tk.LEFT, padx=5)
+        
+        # Фрейм чата
+        self.chat_frame = ttk.Frame(self.main_frame)
+        
+        # Левая панель с контактами
+        left_panel = ttk.Frame(self.chat_frame, width=200)
+        left_panel.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 5))
+        left_panel.pack_propagate(False)
+        
+        ttk.Label(left_panel, text="📞 Контакты", font=('Arial', 12, 'bold')).pack(pady=10)
+        
+        self.contacts_listbox = tk.Listbox(left_panel, font=('Arial', 10), relief='flat', bg='white')
+        self.contacts_listbox.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.contacts_listbox.bind('<<ListboxSelect>>', self.on_contact_select)
+        
+        btn_frame_left = ttk.Frame(left_panel)
+        btn_frame_left.pack(fill=tk.X, pady=5)
+        
+        ttk.Button(btn_frame_left, text="➕ Добавить", command=self.add_contact).pack(fill=tk.X, padx=5, pady=2)
+        ttk.Button(btn_frame_left, text="🔄 Обновить", command=self.load_contacts).pack(fill=tk.X, padx=5, pady=2)
+        ttk.Button(btn_frame_left, text="🚪 Выход", command=self.logout).pack(fill=tk.X, padx=5, pady=2)
+        
+        # Правая панель с чатом
+        right_panel = ttk.Frame(self.chat_frame)
+        right_panel.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        
+        self.chat_display = scrolledtext.ScrolledText(right_panel, font=('Arial', 10), wrap=tk.WORD, state='disabled')
+        self.chat_display.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        input_frame = ttk.Frame(right_panel)
+        input_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        self.message_entry = ttk.Entry(input_frame, font=('Arial', 10))
+        self.message_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+        self.message_entry.bind('<Return>', self.send_message)
+        
+        ttk.Button(input_frame, text="📤 Отправить", command=self.send_message).pack(side=tk.RIGHT)
+    
+    def show_auth_frame(self):
+        self.chat_frame.pack_forget()
+        self.auth_frame.pack(fill=tk.BOTH, expand=True)
+        self.username_entry.focus()
+    
+    def show_chat_frame(self):
+        self.auth_frame.pack_forget()
+        self.chat_frame.pack(fill=tk.BOTH, expand=True)
+        self.load_contacts()
+        self.message_entry.focus()
+    
+    def register(self):
+        username = self.username_entry.get().strip()
+        password = self.password_entry.get().strip()
+        
+        if not username or not password:
+            messagebox.showerror("Ошибка", "Введите логин и пароль")
+            return
+        
+        if len(password) < 4:
+            messagebox.showerror("Ошибка", "Пароль должен содержать минимум 4 символа")
+            return
+        
+        if self.db.create_user(username, password):
+            messagebox.showinfo("Успех", "Аккаунт успешно создан! Теперь вы можете войти.")
+            self.username_entry.delete(0, tk.END)
+            self.password_entry.delete(0, tk.END)
+        else:
+            messagebox.showerror("Ошибка", "Пользователь с таким именем уже существует")
+    
+    def login(self):
+        username = self.username_entry.get().strip()
+        password = self.password_entry.get().strip()
+        
+        if not username or not password:
+            messagebox.showerror("Ошибка", "Введите логин и пароль")
+            return
+        
+        if self.db.verify_user(username, password):
+            self.current_user = username
+            self.current_password = password
+            # Получаем salt для шифрования
+            conn = sqlite3.connect(DB_NAME)
+            cursor = conn.cursor()
+            cursor.execute("SELECT salt FROM users WHERE username = ?", (username,))
+            salt_hex = cursor.fetchone()[0]
+            conn.close()
+            self.salt = bytes.fromhex(salt_hex)
+            
+            self.show_chat_frame()
+        else:
+            messagebox.showerror("Ошибка", "Неверный логин или пароль")
+    
+    def logout(self):
+        self.current_user = None
+        self.current_password = None
+        self.salt = None
+        self.current_contact = None
+        self.show_auth_frame()
+    
+    def load_contacts(self):
+        if not self.current_user:
+            return
+            
+        self.contacts_listbox.delete(0, tk.END)
+        contacts = self.db.get_contacts(self.current_user)
+        
+        if not contacts:
+            self.contacts_listbox.insert(tk.END, "📝 Нет контактов")
+            self.contacts_listbox.config(state='disabled')
+        else:
+            self.contacts_listbox.config(state='normal')
+            for contact in contacts:
+                self.contacts_listbox.insert(tk.END, f"👤 {contact}")
+    
+    def add_contact(self):
+        if not self.current_user:
+            return
+            
+        contact_username = simpledialog.askstring("Добавить контакт", "Введите имя пользователя:")
+        if contact_username:
+            contact_username = contact_username.strip()
+            if contact_username == self.current_user:
+                messagebox.showerror("Ошибка", "Нельзя добавить себя в контакты")
+                return
+                
+            if self.db.add_contact(self.current_user, contact_username):
+                self.load_contacts()
+            else:
+                messagebox.showerror("Ошибка", "Не удалось добавить контакт или он уже существует")
+    
+    def on_contact_select(self, event):
+        if not self.current_user:
+            return
+            
+        selected = self.contacts_listbox.curselection()
+        if selected:
+            contact_text = self.contacts_listbox.get(selected[0])
+            if contact_text.startswith("👤 "):
+                self.current_contact = contact_text[2:]
+                self.load_chat_history()
+    
+    def load_chat_history(self):
+        if not self.current_user or not self.current_contact:
+            return
+            
+        self.chat_display.config(state='normal')
+        self.chat_display.delete(1.0, tk.END)
+        
+        messages = self.db.get_message_history(self.current_user, self.current_contact, 
+                                             self.current_password, self.salt)
+        
+        for sender, message, timestamp in messages:
+            time_str = datetime.strptime(timestamp, '%Y-%m-%d %H:%M:%S').strftime('%H:%M')
+            
+            if sender == self.current_user:
+                display_msg = f"[{time_str}] Вы: {message}\n"
+                tag = "self"
+            else:
+                display_msg = f"[{time_str}] {sender}: {message}\n"
+                tag = "other"
+            
+            self.chat_display.insert(tk.END, display_msg, tag)
+        
+        # Настраиваем теги для цветов
+        self.chat_display.tag_config("self", foreground="blue")
+        self.chat_display.tag_config("other", foreground="green")
+        
+        self.chat_display.config(state='disabled')
+        self.chat_display.see(tk.END)
+    
+    def send_message(self, event=None):
+        if not self.current_user or not self.current_contact:
+            messagebox.showwarning("Внимание", "Выберите контакт для отправки сообщения")
+            return
+            
+        message = self.message_entry.get().strip()
+        if message:
+            encrypted_msg = self.db.save_message(self.current_user, self.current_contact, 
+                                               message, self.current_password, self.salt)
+            self.message_entry.delete(0, tk.END)
+            self.load_chat_history()  # Обновляем историю
+
+# ==================== ЗАПУСК ПРИЛОЖЕНИЯ ====================
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = MessengerApp(root)
+    
+    # Центрируем окно
+    root.update_idletasks()
+    x = (root.winfo_screenwidth() - root.winfo_reqwidth()) // 2
+    y = (root.winfo_screenheight() - root.winfo_reqheight()) // 2
+    root.geometry(f"+{x}+{y}")
+    
+    root.mainloop()
